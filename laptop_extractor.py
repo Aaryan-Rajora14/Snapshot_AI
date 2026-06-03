@@ -22,7 +22,6 @@ import threading
 import webbrowser
 import json
 import re
-import os
 import io
 import time
 import pathlib
@@ -2081,7 +2080,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 #  ENTRY POINT
 # ─────────────────────────────────────────────
 
-PORT = 7474
+import os
+PORT = int(os.environ.get("PORT", 5000))
 
 def main():
     print("\n" + "═"*58)
@@ -2093,7 +2093,7 @@ def main():
     print("  🆕  Fixes: GPU role detection, Ports tab, Performance tab,")
     print("      CPU deep dive, device detection, side-by-side GPU cards")
     print("═"*58 + "\n")
-    server = http.server.HTTPServer(("localhost", PORT), Handler)
+    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
     def open_browser():
         time.sleep(0.8)
         webbrowser.open(f"http://localhost:{PORT}")
