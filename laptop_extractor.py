@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════╗
-║       LAPTOP SPEC EXTRACTOR  v5  —  by Claude        ║
+║       LAPTOP SPEC EXTRACTOR  v6  —  by Claude        ║
 ║  Drop your DxDiag .txt or .docx → get a sick HTML    ║
 ╚══════════════════════════════════════════════════════╝
 
@@ -13,7 +13,16 @@ Fixes in v5:
   • System tab: detailed CPU info (logical CPUs, GHz, cache)
   • Improved GPU block splitting reliability
 
-Run:  python laptop_extractor_v5.py
+New in v6:
+  • DDR RAM type detection — DxDiag itself never reports RAM generation,
+    so detection is now tiered: explicit match in supplied text (incl.
+    pasted Task Manager / wmic / PowerShell memory output) → memory clock
+    speed inference → CPU-generation estimate as a clearly-labeled fallback
+  • Optional "paste extra RAM info" box in the upload UI for exact DDR
+    detection (confirmed) instead of an estimate
+  • RAM Speed (MT/s) now shown in System Details when available
+
+Run:  python laptop_extractor_v6.py
 Then open your browser at http://localhost:7474
 """
 
@@ -409,6 +418,129 @@ def _extract_cpu_details(processor_str: str) -> dict:
     return cpu
 
 
+# CPU generation/model → likely DDR generation. This is a last-resort
+# heuristic only: the same CPU model frequently ships with different RAM
+# types depending on the OEM motherboard, so it is never reported as
+# "confirmed" — only ever as "estimated".
+_CPU_DDR_HINTS = [
+    (r"Core\s+Ultra",        "DDR5", "Intel Core Ultra (Meteor Lake / Lunar Lake+) laptops ship with DDR5/LPDDR5"),
+    (r"14th Gen",            "DDR5", "Intel 14th Gen mobile most commonly ships with DDR5"),
+    (r"13th Gen",            "DDR5", "Intel 13th Gen H-series mobile commonly ships with DDR5 (some boards use DDR4)"),
+    (r"12th Gen",            "DDR4", "Intel 12th Gen mobile most commonly ships with DDR4 (some premium boards use DDR5)"),
+    (r"11th Gen",            "DDR4", "Intel 11th Gen mobile ships with DDR4"),
+    (r"10th Gen",            "DDR4", "Intel 10th Gen mobile ships with DDR4"),
+    (r"9th Gen",             "DDR4", "Intel 9th Gen mobile ships with DDR4"),
+    (r"8th Gen",             "DDR4", "Intel 8th Gen mobile ships with DDR4"),
+    (r"7th Gen",             "DDR4", "Intel 7th Gen mobile ships with DDR4"),
+    (r"Ryzen\s*\d\s*7\d{2,3}", "DDR5", "AMD Ryzen 7000/8000-series ships with DDR5"),
+    (r"Ryzen\s*\d\s*6\d{2,3}", "DDR5", "AMD Ryzen 6000-series (Rembrandt) ships with LPDDR5/DDR5"),
+    (r"Ryzen\s*\d\s*5\d{2,3}", "DDR4", "AMD Ryzen 5000-series (Cezanne) ships with DDR4"),
+    (r"Ryzen\s*\d\s*4\d{2,3}", "DDR4", "AMD Ryzen 4000-series (Renoir) ships with DDR4"),
+    (r"Ryzen\s*\d\s*3\d{2,3}", "DDR4", "AMD Ryzen 3000-series ships with DDR4"),
+]
+
+
+def _estimate_ddr_from_cpu(cpu_gen: str, processor: str) -> tuple:
+    """
+    Best-effort estimate of DDR generation from CPU generation/model alone.
+    Returns (ddr_label, note) or (None, None) if nothing matches.
+    Never treat this as confirmed — the OEM motherboard, not the CPU,
+    decides which RAM type is actually installed.
+    """
+    combined = f"{cpu_gen} {processor}"
+    for pattern, ddr, note in _CPU_DDR_HINTS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            return ddr, note
+    return None, None
+
+
+def _detect_ram_info(text: str, processor: str, cpu_gen: str = "N/A") -> dict:
+    """
+    Detect RAM DDR generation (and speed, if available) using a tiered
+    strategy, since DxDiag itself almost never reports the DDR generation:
+
+      1. EXPLICIT  — a DDR keyword (or JEDEC "PC4-25600" style module name)
+         found anywhere in the supplied text. This also covers the case
+         where the user pastes extra info into the same file — e.g. the
+         Windows 11 Task Manager → Performance → Memory panel (which shows
+         "DDR4"/"DDR5" directly), `wmic memorychip get MemoryType,Speed`,
+         or PowerShell's `Get-CimInstance Win32_PhysicalMemory` output.
+      2. SPEED-BASED — a memory clock speed (MT/s/MHz) parsed from the same
+         kinds of pasted output, mapped to the DDR generation that speed
+         band belongs to. Reliable since DDR generations rarely overlap.
+      3. CPU ESTIMATE — last resort, clearly labeled as an estimate, since
+         the same CPU ships with different RAM depending on the OEM board.
+    """
+    result = {
+        "ddr": "Unknown",
+        "speed": "N/A",
+        "source": "none",        # explicit | speed | cpu_estimate | none
+        "confidence": "unknown", # confirmed | likely | estimated | unknown
+        "note": "RAM type was not present in the supplied file.",
+    }
+
+    # ── Tier 1a: explicit DDR keyword ───────────────────────────────────
+    # Order matters: match the most specific variants first so LPDDR5X
+    # is not swallowed by the shorter DDR5 pattern.
+    ddr_m = re.search(
+        r'\b(LPDDR5X|LPDDR5|LPDDR4X|LPDDR4|DDR5X|DDR5|DDR4|DDR3L|DDR3|DDR2|DDR)\b',
+        text, re.IGNORECASE
+    )
+    if ddr_m:
+        result["ddr"]        = ddr_m.group(1).upper()
+        result["source"]     = "explicit"
+        result["confidence"] = "confirmed"
+        result["note"]       = "Found explicitly in the supplied system info."
+
+    # ── Tier 1b: JEDEC module naming, e.g. "PC4-25600" (DDR4) / "PC5-38400" (DDR5)
+    if result["source"] == "none":
+        pc_m = re.search(r'\bPC([2345])-?\d{4,6}\b', text, re.IGNORECASE)
+        if pc_m:
+            result["ddr"]        = f"DDR{pc_m.group(1)}"
+            result["source"]     = "explicit"
+            result["confidence"] = "confirmed"
+            result["note"]       = "Derived from JEDEC module naming (PC#-#####) in the supplied info."
+
+    # ── Tier 2: clock speed, e.g. wmic "Speed", PowerShell "ConfiguredClockSpeed",
+    # or Task Manager's "Speed: 4800 MT/s" ──────────────────────────────────
+    speed_m = re.search(
+        r'(?:Configured\s*Clock\s*Speed|Speed)\s*[:=]?\s*(\d{3,5})\s*(?:MT/s|MHz)?',
+        text, re.IGNORECASE
+    )
+    if speed_m:
+        speed = int(speed_m.group(1))
+        if 200 <= speed <= 8000:   # sanity bound — ignore unrelated numbers
+            result["speed"] = f"{speed} MT/s"
+            if result["source"] == "none":
+                if 200 <= speed <= 1066:
+                    ddr_guess = "DDR2"
+                elif 1067 <= speed <= 2400:
+                    ddr_guess = "DDR3"
+                elif 2401 <= speed <= 4266:
+                    ddr_guess = "DDR4"
+                else:
+                    ddr_guess = "DDR5"
+                result["ddr"]        = ddr_guess
+                result["source"]     = "speed"
+                result["confidence"] = "likely"
+                result["note"]       = f"Inferred from a {speed} MT/s memory clock speed found in the supplied info."
+
+    # ── Tier 3: CPU-generation heuristic (last resort, clearly an estimate) ──
+    if result["source"] == "none":
+        ddr_guess, cpu_note = _estimate_ddr_from_cpu(cpu_gen, processor)
+        if ddr_guess:
+            result["ddr"]        = ddr_guess
+            result["source"]     = "cpu_estimate"
+            result["confidence"] = "estimated"
+            result["note"]       = (
+                f"Estimated from CPU generation only — {cpu_note}. "
+                f"Actual RAM type depends on the motherboard; verify with CPU-Z, "
+                f"Task Manager, or your laptop's spec sheet for certainty."
+            )
+
+    return result
+
+
 def parse_dxdiag(text: str) -> dict:
     """Extract all useful fields from DxDiag output."""
     data = {}
@@ -527,6 +659,15 @@ def parse_dxdiag(text: str) -> dict:
         data["ram_gb"] = f"{mb // 1024} GB" if mb >= 1024 else f"{mb} MB"
     else:
         data["ram_gb"] = data["memory"]
+
+    # DDR type + speed detection (tiered: explicit → speed-based → CPU estimate)
+    ram_info = _detect_ram_info(text, data["processor"], data["cpu_gen"])
+    data["ram_ddr"]            = ram_info["ddr"]
+    data["ram_speed"]          = ram_info["speed"]
+    data["ram_ddr_source"]     = ram_info["source"]      # explicit | speed | cpu_estimate | none
+    data["ram_ddr_confidence"] = ram_info["confidence"]  # confirmed | likely | estimated | unknown
+    data["ram_ddr_note"]       = ram_info["note"]
+    data["ram_ddr_confirmed"]  = ram_info["confidence"] == "confirmed"   # kept for backward compat
 
     # ── Display size ───────────────────────────────────────────────────────────
     data["display_size"] = "15.6\""
@@ -727,7 +868,38 @@ def generate_html(data: dict) -> str:
   <div class="wc-desc">{desc}</div>
 </div>"""
 
-    # Performance — estimate from GPU name
+    # RAM DDR display helpers — reflects the tiered detection confidence
+    ram_ddr        = data.get("ram_ddr", "Unknown")
+    ram_speed      = data.get("ram_speed", "N/A")
+    ram_confidence = data.get("ram_ddr_confidence", "unknown")  # confirmed | likely | estimated | unknown
+    ram_note       = data.get("ram_ddr_note", "")
+
+    if ram_confidence == "confirmed":
+        ram_ddr_label = ram_ddr                          # e.g. "DDR4", "LPDDR5"
+        ram_tag_text  = ram_ddr
+        ram_tag_class = "cyan"
+        ram_note_html = ""
+    elif ram_confidence == "likely":
+        ram_ddr_label = f"{ram_ddr} (from clock speed)"
+        ram_tag_text  = f"{ram_ddr} · {ram_speed}"
+        ram_tag_class = "cyan"
+        ram_note_html = f'<div class="info-banner" style="margin-top:10px">ℹ {ram_note}</div>'
+    elif ram_confidence == "estimated":
+        ram_ddr_label = f"{ram_ddr} (estimated)"
+        ram_tag_text  = f"{ram_ddr} · EST."
+        ram_tag_class = "amber"
+        ram_note_html = f'<div class="info-banner" style="margin-top:10px">⚠ {ram_note}</div>'
+    else:
+        ram_ddr_label = "Not detected"
+        ram_tag_text  = "RAM"
+        ram_tag_class = "amber"
+        ram_note_html = (
+            '<div class="info-banner" style="margin-top:10px">ℹ DxDiag does not report RAM generation. '
+            'For an exact reading, paste your Task Manager → Performance → Memory panel, or the output of '
+            '<code>wmic memorychip get MemoryType,Speed</code>, into the uploaded file.</div>'
+        )
+
+
     def _est_fps(game: str, gpu: str) -> str:
         # Normalize: strip trademark/registered symbols so "Intel(R) UHD" matches "intel uhd"
         g = re.sub(r'\(r\)|\(tm\)|\(c\)', ' ', gpu.lower())
@@ -1191,6 +1363,9 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
 .footer-logo{{font-family:'Orbitron',sans-serif;font-size:11px;font-weight:800;letter-spacing:4px;color:var(--muted);text-transform:uppercase}}
 .footer-time{{margin-top:5px;font-family:'Share Tech Mono',monospace;font-size:10px;color:rgba(100,116,139,0.4)}}
 
+/* ── MOBILE TAB BAR ── */
+.mobile-tabbar{{display:none}}
+
 @media(max-width:860px){{
   .hero{{grid-template-columns:1fr}}.laptop-visual{{order:-1}}
   .cards-3,.cards-4{{grid-template-columns:1fr 1fr}}
@@ -1201,6 +1376,53 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
   .thermal-grid{{grid-template-columns:1fr 1fr}}
   .port-summary{{grid-template-columns:repeat(3,1fr)}}
   .wireless-row{{grid-template-columns:1fr}}
+
+  /* Hide desktop nav items on mobile */
+  .nav-tabs{{display:none}}
+  .nav-right{{display:none}}
+  .navbar{{padding:0 16px;height:52px}}
+
+  /* Mobile tab bar */
+  .mobile-tabbar{{
+    display:flex;
+    position:sticky;
+    top:52px;
+    z-index:99;
+    background:rgba(6,8,16,0.97);
+    backdrop-filter:blur(20px);
+    border-bottom:2px solid var(--border);
+    overflow-x:auto;
+    scrollbar-width:none;
+    -webkit-overflow-scrolling:touch;
+  }}
+  .mobile-tabbar::-webkit-scrollbar{{display:none}}
+  .mob-tab{{
+    flex:1;
+    min-width:56px;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    padding:8px 6px 7px;
+    font-family:'Share Tech Mono',monospace;
+    font-size:8px;
+    letter-spacing:0.5px;
+    text-transform:uppercase;
+    color:var(--muted);
+    background:none;
+    border:none;
+    border-bottom:2px solid transparent;
+    margin-bottom:-2px;
+    cursor:pointer;
+    transition:color .2s,border-color .2s;
+    white-space:nowrap;
+    gap:4px;
+  }}
+  .mob-tab .mt-icon{{font-size:19px;line-height:1}}
+  .mob-tab .mt-label{{font-size:7.5px;margin-top:2px}}
+  .mob-tab.active{{color:var(--green);border-bottom-color:var(--green)}}
+  .mob-tab:hover{{color:var(--text)}}
+  .wrap{{padding:0 14px 60px}}
 }}
 </style>
 </head>
@@ -1208,14 +1430,33 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
 <nav class="navbar">
   <div class="nav-brand">{data.get('manufacturer','SYSTEM')} <span>PROFILE</span></div>
   <div class="nav-tabs">
-    <button class="nav-tab active" onclick="switchTab('overview')">Overview</button>
-    <button class="nav-tab" onclick="switchTab('gpu')">GPU &amp; Display</button>
-    <button class="nav-tab" onclick="switchTab('ports')">Ports &amp; I/O</button>
-    <button class="nav-tab" onclick="switchTab('performance')">Performance</button>
-    <button class="nav-tab" onclick="switchTab('system')">System</button>
+    <button class="nav-tab active" onclick="switchTab('overview')">🏠 Overview</button>
+    <button class="nav-tab" onclick="switchTab('gpu')">🎮 GPU &amp; Display</button>
+    <button class="nav-tab" onclick="switchTab('ports')">🔌 Ports &amp; I/O</button>
+    <button class="nav-tab" onclick="switchTab('performance')">📊 Performance</button>
+    <button class="nav-tab" onclick="switchTab('system')">⚙️ System</button>
   </div>
   <div class="nav-right"><span class="status-dot"></span>Report Loaded</div>
 </nav>
+
+<!-- Mobile tab bar (only visible on narrow screens) -->
+<div class="mobile-tabbar" id="mobile-tabbar">
+  <button class="mob-tab active" onclick="switchTab('overview')">
+    <span class="mt-icon">🏠</span><span class="mt-label">Overview</span>
+  </button>
+  <button class="mob-tab" onclick="switchTab('gpu')">
+    <span class="mt-icon">🎮</span><span class="mt-label">GPU</span>
+  </button>
+  <button class="mob-tab" onclick="switchTab('ports')">
+    <span class="mt-icon">🔌</span><span class="mt-label">Ports</span>
+  </button>
+  <button class="mob-tab" onclick="switchTab('performance')">
+    <span class="mt-icon">📊</span><span class="mt-label">Perf</span>
+  </button>
+  <button class="mob-tab" onclick="switchTab('system')">
+    <span class="mt-icon">⚙️</span><span class="mt-label">System</span>
+  </button>
+</div>
 
 <!-- ══════ OVERVIEW ══════ -->
 <div class="page active" id="page-overview">
@@ -1230,7 +1471,7 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
         BIOS · {data.get('bios','N/A')}
       </p>
       <div class="hero-stats">
-        <div class="hstat"><div class="hstat-val">{data.get('ram_gb','?')}</div><div class="hstat-label">RAM</div></div>
+        <div class="hstat"><div class="hstat-val">{data.get('ram_gb','?')}</div><div class="hstat-label">RAM · {ram_tag_text}</div></div>
         <div class="hstat"><div class="hstat-val">{data.get('refresh','?')} Hz</div><div class="hstat-label">Refresh</div></div>
         <div class="hstat"><div class="hstat-val">{data.get('res_w','?')}×{data.get('res_h','?')}</div><div class="hstat-label">Resolution</div></div>
         <div class="hstat"><div class="hstat-val">{cpu.get('logical','?')}</div><div class="hstat-label">CPU Threads</div></div>
@@ -1286,8 +1527,8 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
       <span class="card-icon">🧠</span>
       <div class="card-label">Memory</div>
       <div class="card-val big">{data.get('ram_gb','N/A')}</div>
-      <div class="card-sub">Available: {data.get('available_mem','N/A')}</div>
-      <span class="tag cyan">RAM</span>
+      <div class="card-sub">{ram_ddr_label} · Available: {data.get('available_mem','N/A')}</div>
+      <span class="tag {ram_tag_class}">{ram_tag_text}</span>
     </div>
     <div class="card">
       <span class="card-icon">🎮</span>
@@ -1321,7 +1562,7 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
 
   <div class="footer">
     <div class="footer-logo">{data.get('model','System Profile')}</div>
-    <div class="footer-time">Generated {ts} · DxDiag Extractor v5</div>
+    <div class="footer-time">Generated {ts} · DxDiag Extractor v6</div>
   </div>
 </div>
 </div>
@@ -1469,7 +1710,7 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
     <div class="perf-stat">
       <div class="perf-stat-label">RAM</div>
       <div class="perf-stat-val" style="color:#a78bfa">{data.get('ram_gb','?')}</div>
-      <div class="perf-stat-sub">Available: {data.get('available_mem','N/A')}</div>
+      <div class="perf-stat-sub">{ram_ddr_label} · Available: {data.get('available_mem','N/A')}</div>
     </div>
   </div>
 
@@ -1541,7 +1782,7 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
         <tr><td>L3 Cache</td><td>{cpu.get('cache','N/A')}</td></tr>
         <tr><td>GPU (Discrete)</td><td>{data.get('gpu1_name','N/A')} · VRAM: {data.get('dedicated_mem','N/A')} · Total: {data.get('display_mem','N/A')}</td></tr>
         <tr><td>GPU (Integrated)</td><td>{gpu2_name} · {gpu2_mem}</td></tr>
-        <tr><td>RAM</td><td>{data.get('ram_gb','N/A')} · Available: {data.get('available_mem','N/A')}</td></tr>
+        <tr><td>RAM</td><td>{data.get('ram_gb','N/A')} {ram_ddr_label} · Available: {data.get('available_mem','N/A')}</td></tr>
         <tr><td>Display</td><td>{data.get('res_w','?')}×{data.get('res_h','?')} · {data.get('refresh','?')}Hz · {data.get('monitor_id','N/A')}</td></tr>
         <tr><td>Operating System</td><td>{data.get('os','N/A')[:80]}</td></tr>
         <tr><td>DirectX</td><td>{data.get('directx','N/A')} · WDDM {data.get('wddm','N/A')}</td></tr>
@@ -1628,7 +1869,8 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
     <div class="sys-item"><div class="sys-k">OS</div><div class="sys-v">{data.get('os','N/A')[:40]}</div></div>
     <div class="sys-item"><div class="sys-k">BIOS</div><div class="sys-v">{data.get('bios','N/A')}</div></div>
     <div class="sys-item"><div class="sys-k">Processor</div><div class="sys-v">{data.get('processor','N/A')[:40]}</div></div>
-    <div class="sys-item"><div class="sys-k">Memory</div><div class="sys-v">{data.get('memory','N/A')}</div></div>
+    <div class="sys-item"><div class="sys-k">Memory</div><div class="sys-v">{data.get('memory','N/A')} · {ram_ddr_label}</div></div>
+    <div class="sys-item"><div class="sys-k">RAM Speed</div><div class="sys-v">{ram_speed}</div></div>
     <div class="sys-item"><div class="sys-k">Page File</div><div class="sys-v">{data.get('page_file','N/A')[:35]}</div></div>
     <div class="sys-item"><div class="sys-k">DirectX</div><div class="sys-v">{data.get('directx','N/A')}</div></div>
     <div class="sys-item"><div class="sys-k">DPI Setting</div><div class="sys-v">{data.get('dpi','N/A')}</div></div>
@@ -1638,6 +1880,8 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
     <div class="sys-item"><div class="sys-k">MUX Target GPU</div><div class="sys-v">{data.get('mux_target','N/A')}</div></div>
     <div class="sys-item"><div class="sys-k">DxDiag Version</div><div class="sys-v">{data.get('dxdiag_ver','N/A')[:30]}</div></div>
   </div>
+  {ram_note_html}
+
 
   <div class="divider"><div class="divider-line"></div><div class="divider-label">Full Raw Data</div><div class="divider-line"></div></div>
   <div class="card" style="padding:0;overflow:auto">
@@ -1651,7 +1895,7 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
 
   <div class="footer">
     <div class="footer-logo">{data.get('model','System Profile')} · System</div>
-    <div class="footer-time">Generated {ts} · DxDiag Extractor v5</div>
+    <div class="footer-time">Generated {ts} · DxDiag Extractor v6</div>
   </div>
 </div>
 </div>
@@ -1660,9 +1904,12 @@ body::before{{content:'';position:fixed;inset:0;background:radial-gradient(ellip
 function switchTab(name){{
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.mob-tab').forEach(t=>t.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
   const tabs=['overview','gpu','ports','performance','system'];
-  document.querySelectorAll('.nav-tab')[tabs.indexOf(name)].classList.add('active');
+  const idx = tabs.indexOf(name);
+  document.querySelectorAll('.nav-tab')[idx].classList.add('active');
+  document.querySelectorAll('.mob-tab')[idx].classList.add('active');
   window.scrollTo({{top:0,behavior:'smooth'}});
 }}
 </script>
@@ -1682,7 +1929,9 @@ APP_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DxDiag Extractor v5</title>
+<meta name="google-adsense-account" content="ca-pub-2657651974670200">
+<title>DxDiag Extractor v6</title>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2657651974670200" crossorigin="anonymous"></script>
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800;900&family=Share+Tech+Mono&family=Syne:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -1724,6 +1973,18 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 .browse-btn{display:inline-flex;align-items:center;gap:8px;background:rgba(0,255,136,0.1);border:1px solid rgba(0,255,136,0.3);color:var(--green);font-family:'Share Tech Mono',monospace;font-size:11px;letter-spacing:1.5px;padding:9px 20px;border-radius:8px;cursor:pointer;transition:all .2s;text-transform:uppercase;}
 .browse-btn:hover{background:rgba(0,255,136,0.18);border-color:rgba(0,255,136,0.6);box-shadow:0 0 20px rgba(0,255,136,0.1)}
 .file-info{display:none;margin-top:16px;background:rgba(0,255,136,0.06);border:1px solid rgba(0,255,136,0.2);border-radius:8px;padding:10px 14px;font-family:'Share Tech Mono',monospace;font-size:11px;align-items:center;gap:10px;}
+.ram-extra{margin-top:18px;border:1px solid rgba(0,229,255,0.2);border-radius:10px;overflow:hidden}
+.ram-extra-toggle{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 14px;cursor:pointer;background:rgba(0,229,255,0.05);font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--cyan);letter-spacing:.5px;user-select:none}
+.ram-extra-toggle:hover{background:rgba(0,229,255,0.09)}
+.ram-extra-arrow{transition:transform .25s}
+.ram-extra.open .ram-extra-arrow{transform:rotate(90deg)}
+.ram-extra-body{display:none;padding:14px;border-top:1px solid rgba(0,229,255,0.15)}
+.ram-extra.open .ram-extra-body{display:block}
+.ram-extra-hint{font-family:'Share Tech Mono',monospace;font-size:10.5px;color:var(--muted);line-height:1.7;margin-bottom:10px}
+.ram-extra-hint code{color:var(--cyan);background:rgba(0,229,255,0.08);padding:1px 5px;border-radius:3px}
+.ram-extra textarea{width:100%;min-height:90px;resize:vertical;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;color:#fff;font-family:'Share Tech Mono',monospace;font-size:11px;padding:10px;outline:none}
+.ram-extra textarea:focus{border-color:rgba(0,229,255,0.5)}
+.ram-extra textarea::placeholder{color:var(--muted)}
 .file-info.show{display:flex}
 .file-icon{font-size:20px;flex-shrink:0}
 .file-name{color:var(--green);flex:1;word-break:break-all}
@@ -1775,12 +2036,12 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
 </head>
 <body>
 <nav class="navbar">
-  <div class="nav-logo">DxDiag <span>Extractor</span> <span style="font-size:9px;color:var(--muted);letter-spacing:1px">v5</span></div>
+  <div class="nav-logo">DxDiag <span>Extractor</span> <span style="font-size:9px;color:var(--muted);letter-spacing:1px">v6</span></div>
   <div class="nav-status"><div class="dot"></div><span id="status-text">READY · PORT 7474</span></div>
 </nav>
 
 <section class="hero">
-  <div class="hero-eyebrow">System Profile Generator v5</div>
+  <div class="hero-eyebrow">System Profile Generator v6</div>
   <h1 class="hero-title">Drop your DxDiag<br><span class="accent">Get a sick HTML</span></h1>
   <p class="hero-sub">Upload any .txt or .docx DxDiag file · GPU roles auto-detected · 5 tabs including Ports, Performance, CPU deep-dive.</p>
   <div class="feat-row">
@@ -1789,6 +2050,7 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
     <span class="feat-chip">✓ PERFORMANCE TAB</span>
     <span class="feat-chip">✓ CPU DEEP DIVE</span>
     <span class="feat-chip">✓ DEVICE LIST</span>
+    <span class="feat-chip">✓ DDR RAM DETECTION</span>
   </div>
 </section>
 
@@ -1809,6 +2071,21 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
       <span class="file-name" id="fileName">—</span>
       <span class="file-size" id="fileSize">—</span>
       <button class="clear-file-btn" onclick="clearFile()" title="Remove file">✕</button>
+    </div>
+    <div class="ram-extra" id="ramExtra">
+      <div class="ram-extra-toggle" onclick="document.getElementById('ramExtra').classList.toggle('open')">
+        <span>🧠 Want the <em>exact</em> RAM type (DDR4/DDR5)? Add it here — optional</span>
+        <span class="ram-extra-arrow">▶</span>
+      </div>
+      <div class="ram-extra-body">
+        <div class="ram-extra-hint">
+          DxDiag doesn't report RAM generation, so we estimate it from your CPU unless you give us more.
+          For an exact reading, paste the contents of Task Manager → Performance → Memory, or run
+          <code>wmic memorychip get MemoryType,Speed,Capacity</code> (cmd) or
+          <code>Get-CimInstance Win32_PhysicalMemory</code> (PowerShell) and paste the output below.
+        </div>
+        <textarea id="ramExtraInput" placeholder="Paste Task Manager / wmic / PowerShell RAM output here (optional)..."></textarea>
+      </div>
     </div>
     <div class="progress-wrap" id="progressWrap">
       <div class="progress-label" id="progressLabel">INITIALIZING...</div>
@@ -1877,6 +2154,8 @@ function clearFile() {
   document.getElementById('fileInfo').classList.remove('show');
   document.getElementById('generateBtn').disabled = true;
   document.getElementById('fileInput').value = '';
+  document.getElementById('ramExtraInput').value = '';
+  document.getElementById('ramExtra').classList.remove('open');
   document.getElementById('progressWrap').classList.remove('show');
   document.getElementById('progressFill').style.width = '0%';
   document.getElementById('status-text').textContent = 'READY · PORT 7474';
@@ -1906,6 +2185,8 @@ async function generate() {
   }
   const formData = new FormData();
   formData.append('file', selectedFile);
+  const ramExtraText = document.getElementById('ramExtraInput').value.trim();
+  if (ramExtraText) formData.append('ram_extra', ramExtraText);
   try {
     document.getElementById('status-text').textContent = 'PROCESSING...';
     const resp = await fetch('/upload', { method: 'POST', body: formData });
@@ -1991,6 +2272,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in ("/", ""):
             self._send(200, "text/html", APP_HTML.encode())
+        elif parsed.path == "/ads.txt":
+            ads_content = b"google.com, pub-2657651974670200, DIRECT, f08c47fec0942fa0\n"
+            self._send(200, "text/plain", ads_content)
         elif parsed.path == "/open":
             qs = urllib.parse.parse_qs(parsed.query)
             fp = qs.get("path", [""])[0]
@@ -2016,6 +2300,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 parts = body.split(b"--" + bnd)
                 file_data = None
                 file_name = "upload.txt"
+                ram_extra_text = ""
                 for part in parts:
                     if b"filename=" in part:
                         fn_m = re.search(rb'filename="(.+?)"', part)
@@ -2024,6 +2309,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         idx = part.find(b"\r\n\r\n")
                         if idx != -1:
                             file_data = part[idx+4:].rstrip(b"\r\n")
+                    elif b'name="ram_extra"' in part:
+                        idx = part.find(b"\r\n\r\n")
+                        if idx != -1:
+                            ram_extra_text = part[idx+4:].rstrip(b"\r\n").decode("utf-8", errors="ignore")
                 if file_data is None:
                     self._json({"success": False, "error": "No file data received"})
                     return
@@ -2032,6 +2321,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with open(tmp, "wb") as f:
                     f.write(file_data)
                 text = read_file(str(tmp))
+                if ram_extra_text:
+                    # Append any pasted Task Manager / wmic / PowerShell RAM
+                    # info so the DDR detector can find an explicit match.
+                    text += "\n\n" + ram_extra_text
                 data = parse_dxdiag(text)
                 html = generate_html(data)
                 safe_model = re.sub(r"[^\w\-]", "_", data.get("model", "System"))[:30]
@@ -2085,7 +2378,7 @@ PORT = int(os.environ.get("PORT", 5000))
 
 def main():
     print("\n" + "═"*58)
-    print("  ⚡  DxDiag Extractor  v5  ·  by Claude")
+    print("  ⚡  DxDiag Extractor  v6  ·  by Claude")
     print("═"*58)
     print(f"  🌐  http://localhost:{PORT}")
     print(f"  📁  Output dir: {UPLOAD_DIR}")
